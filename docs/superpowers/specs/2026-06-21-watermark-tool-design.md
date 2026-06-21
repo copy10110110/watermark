@@ -1,4 +1,4 @@
-# Watermark Tool — 批量水印 + AI 检测 设计文档 (v2)
+# Watermark Tool — 批量水印 + AI 检测 设计文档 (v3)
 
 **日期**: 2026-06-21
 **状态**: 设计中
@@ -12,58 +12,87 @@
 - **标签页 A（嵌入水印）**: 图片 + 文本 → 盲水印嵌入（单张/批量）
 - **标签页 B（提取/验证）**: 带水印图片 → 水印文本提取 + AI 生成检测
 
-## 2. watermark prompt 调用协议
+## 2. watermark 调用协议
 
-`watermark` 的实质是 `blind-watermark` Python 库的本地函数调用，不是外部 prompt。
+`watermark` 的实质是 `blind-watermark` Python 库的本地函数调用。
 
-### 2.1 嵌入接口
+### 2.1 算法参数与鲁棒性
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `strength` | 0.8 | 嵌入强度（0.1-1.0），越高越抗攻击但可见度增加 |
+| `domain` | `"dwt"` | 频域选择：`dwt`（离散小波变换）/ `dct`（离散余弦变换） |
+| `password` | `""` | 可选加密密码，用于水印置乱和提取验证 |
+| `wm_length` | 自动 | 水印文本长度决定，最长 1024 字符 |
+
+**鲁棒性目标：**
+
+| 攻击类型 | 目标 | 验证方法 |
+|----------|------|----------|
+| JPEG 压缩 (quality≥70) | 提取准确率 > 90% | 嵌入后压缩 → 提取 → 对比 |
+| 缩放 (≥50%) | 提取准确率 > 80% | Pillow resize → 提取 → 对比 |
+| 裁剪 (保留 ≥75%) | 提取准确率 > 70% | 中心裁剪 75% → 提取 → 对比 |
+| 旋转 (±5°) | 提取准确率 > 60% | Pillow rotate → 提取 → 对比 |
+| 无损格式转换 (PNG→JPEG→PNG) | 提取准确率 > 85% | 格式转换 → 提取 → 对比 |
+
+### 2.2 嵌入接口
+
 ```python
 def embed_watermark(
     image_path: Path,
     text: str,
-    password: str = "",           # 可选加密密码，默认无
+    password: str = "",
+    strength: float = 0.8,
+    domain: Literal["dwt", "dct"] = "dwt",
     output_path: Path | None = None
 ) -> EmbedResult:
     """
     返回:
       EmbedResult:
         success: bool
-        output_path: Path         # 输出文件路径
-        error: str | None         # 失败原因
-        elapsed_ms: int           # 耗时
+        output_path: Path
+        error: str | None          # 失败原因（字符串错误码，见 §2.4）
+        elapsed_ms: int
     异常: 不抛出，全部捕获到 EmbedResult.error
-    超时: 单张 60s，超时返回 error="timeout"
+    超时: 单张 60s，超时返回 error="WATERMARK_TIMEOUT"
     """
 ```
 
-### 2.2 提取接口
+### 2.3 提取接口
+
 ```python
 def extract_watermark(
     image_path: Path,
-    password: str = ""            # 与嵌入时一致
+    password: str = ""
 ) -> ExtractResult:
     """
     返回:
       ExtractResult:
         success: bool
-        text: str | None          # 提取的水印文本，无水印时为 None
-        confidence: float         # 盲水印库返回的置信度 0-1
+        text: str | None           # 无水印时为 None, error="WATERMARK_NOT_FOUND"
+        confidence: float          # 0-1
         error: str | None
         elapsed_ms: int
     超时: 单张 30s
     """
 ```
 
-### 2.3 错误返回码
-| code | 含义 |
-|------|------|
-| 0 | 成功 |
-| 1 | 文件不存在/无法读取 |
-| 2 | 格式不支持 |
-| 3 | 图片中未检测到水印（仅提取） |
-| 4 | 超时 |
-| 5 | 水印文本过长（>1024字符） |
-| 99 | 未知内部错误 |
+### 2.4 错误码（字符串语义码）
+
+| 错误码 | 含义 | 触发条件 |
+|--------|------|----------|
+| `SUCCESS` | 成功 | — |
+| `FILE_NOT_FOUND` | 文件不存在/无法读取 | `Path.exists()` 为 false |
+| `FORMAT_UNSUPPORTED` | 格式不支持 | 扩展名不在支持列表 |
+| `WATERMARK_NOT_FOUND` | 图片中未检测到水印 | 提取置信度 < 阈值 |
+| `WATERMARK_TIMEOUT` | 处理超时 | 嵌入 > 60s / 提取 > 30s |
+| `WATERMARK_TEXT_TOO_LONG` | 水印文本过长 | len(text) > 1024 |
+| `WATERMARK_TEXT_EMPTY` | 水印文本为空 | text == "" |
+| `IMAGE_TOO_LARGE` | 图片尺寸超限 | 像素数 > MAX_IMAGE_PIXELS |
+| `IMAGE_CORRUPTED` | 图片文件损坏 | PIL 无法打开 |
+| `INTERNAL_ERROR` | 未知内部错误 | 未预期的异常 |
+
+**扩展规则**: 新增错误码按 `CATEGORY_DETAIL` 命名，用下划线分隔，不超过 64 字符。
 
 ## 3. 架构概览
 
@@ -89,131 +118,170 @@ def extract_watermark(
    └── static/             # htmx.js, 自定义 JS
 ```
 
-**核心原则：**
-- 单进程 FastAPI，htmx + SSE 驱动实时更新（无需 WebSocket）
-- SPAI 推理单张串行处理，避免 GPU 内存溢出
+**核心原则（v3 修订）：**
+- 单进程 FastAPI，htmx + SSE + REST 兜底（SSE 断线时查询 REST API 获取状态）
+- SPAI 推理单张串行，避免 GPU 内存溢出
 - opencli URL 检测按输入顺序依次执行，Chrome 单实例
-- 盲水印嵌入/提取用 `run_in_executor` 放入线程池（CPU 密集）
-- 两个标签页共享同一个任务队列（`asyncio.Queue`），最多 1 个活跃任务
-- 切换标签页不中断任务；任务状态通过 SSE 全局广播
+
+### 3.1 任务队列架构（v3 修订）
+
+**放弃单队列设计，改为类型分离 + 可配置并发：**
+
+```
+用户提交 → 任务路由器
+            │
+            ├── embed 队列（并发数: min(4, cpu_count)）
+            ├── extract 队列（并发数: min(4, cpu_count)）
+            ├── detect 队列（并发数: 1，GPU 限制）
+            └── url-detect 队列（并发数: 1，Chrome 实例限制）
+
+- 不同队列独立运行，不互相阻塞
+- 同类型队列内按 FIFO + priority 排序
+- 用户可提交任务到任一队列，即使另一队列正在处理
+- 每个队列独立显示排队长度，前端展示"队列中 N 个任务"
+```
 
 ## 4. 模块设计
 
 ### 4.1 水印服务 (`watermark_service.py`)
+
 ```
 封装 blind-watermark 库：
-├── embed_batch(images: list[Path], mapping: dict[str,str], mode: Literal["uniform","mapped"]) -> BatchResult
-├── extract_batch(images: list[Path]) -> BatchResult
+├── embed_batch(images, mapping, mode, params) -> BatchResult
+│   参数: strength=0.8, domain="dwt", password=""
+├── extract_batch(images, password="") -> BatchResult
+├── verify_robustness(original, watermarked, attack) -> RobustnessReport
+│   攻击类型: jpeg_compress(70), resize(0.5), crop(0.75), rotate(5)
 └── 索引映射规则（详见 §6）
 ```
 
 ### 4.2 SPAI 频谱检测 (`spai_service.py`)
+
 ```
-├── detect_ai(image_path: Path) -> dict
-│   返回: {
-│     "ai_score": float,         # AI 生成概率 0-1
-│     "verdict": str,            # "likely_real" | "likely_ai" | "uncertain"
-│     "spectral_mse": float,     # 频谱重建 MSE
-│     "ring_anomaly": float,     # Tree-Ring 频环异常度 0-1
-│     "synthid_flag": bool,      # SynthID 频谱异常标记
-│     "elapsed_ms": int
-│   }
+├── detect_ai(image_path: Path) -> DetectResult
+│   返回字段见下表
 ├── 基于 spai-main 的 __main__.py infer 流程
 ├── 单张推理，GPU 内存友好
 └── 置信度阈值:
-    - ai_score >= 0.7 → "likely_ai"
-    - ai_score <= 0.3 → "likely_real"
-    - 0.3 < ai_score < 0.7 → "uncertain"
+    - ai_score >= 0.7 → verdict="likely_ai"
+    - ai_score <= 0.3 → verdict="likely_real"
+    - 0.3 < ai_score < 0.7 → verdict="uncertain"
 ```
 
 ### 4.3 Tree-Ring 频环检测 (`ring_detector.py`)
+
 ```
 策略：频谱环带异常检测（约 50 行新增代码）
 ├── 基于 SPAI filters.py 的 filter_image_frequencies() 输出
-├── 计算 3 个半径频环（低频/中频/高频）的能量峰值偏离度
-├── 与预计算的 100 张真实图像基线（h=0 假设检验）对比
-├── 输出 ring_anomaly_score（0-1）
-│   - >= 0.6 → 标记为"频环异常"
-│   - < 0.6 → 正常范围
+├── 计算 3 个半径频环的能量峰值偏离度
+├── 与基线数据对比（基线详见 §4.7）
+├── 输出 ring_anomaly_score（0-1），>= 0.6 标记异常
 └── 注解：非硬性判定，仅作为辅助信号
 ```
 
 ### 4.4 SynthID 降级策略
+
 ```
-策略：频谱泛化 + 异常检测（无公开检测器时的降级方案）
+策略：频谱泛化 + 异常检测
 ├── 复用 SPAI 频谱重建 MSE
-├── 将 MSE 与已知无水印的 AI 生成图像基线对比
-├── Z-score 检验（双侧，α=0.05）→ |Z| > 1.96 标记 synthid_flag=true
-├── 使用 Kernel Density Estimation(KDE) 估计基线分布
-└── 最终输出文本描述而非硬性判定：
-    "AI 水印未确认，但存在以下信号：C2PA=xxx, 频谱异常=xxx, 频环异常=xxx"
+├── 与基线 MSE 分布对比（KDE + Z-score，α=0.05）
+├── |Z| > 1.96 标记 synthid_flag=true
+└── 最终输出文本描述，非硬性判定
 ```
 
 ### 4.5 C2PA 元数据 (`c2pa_service.py`)
+
 ```
-├── parse_c2pa(image_path: Path) -> dict | None
-│   返回 C2PA manifest 或 None（无声明）
-├── parse_exif(image_path: Path) -> dict
-│   返回关键 EXIF 字段：
-│   {software, artist, make, model, datetime, gps_lat, gps_lon,
-│    ai_tags: [...]}  # 如 "Created with DALL-E" 等
+├── parse_c2pa(image_path) -> dict | None
+├── parse_exif(image_path) -> dict
+│   {software, artist, make, model, datetime, gps_lat, gps_lon, ai_tags: [...]}
 ├── 检测优先级：C2PA > EXIF AI tags > 无元数据
-└── 结果不带硬性结论，仅展示元数据内容
+└── 结果不输出硬性结论，仅展示元数据
 ```
 
 ### 4.6 OpenCLI 服务 (`opencli_service.py`)
+
 ```
-调用方式：subprocess 执行 opencli CLI（不是 CDP 直连，不是 Selenium）
+调用方式：subprocess 执行 opencli CLI（非 CDP 直连，非 Selenium）
+
+Chrome 路径策略（v3 新增 fallback）:
+  1. config.yaml 的 chrome_path（显式配置，优先级最高）
+  2. 环境变量 CHROME_PATH
+  3. 自动探测（按顺序尝试）:
+     Windows: C:\Program Files\Google\Chrome\Application\chrome.exe
+              C:\Program Files (x86)\Google\Chrome\Application\chrome.exe
+              %LOCALAPPDATA%\Google\Chrome\Application\chrome.exe
+     Linux:   /usr/bin/google-chrome
+     macOS:   /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+  4. 以上均失败 → 服务启动时打印 WARNING 日志，OpenCLI 功能在 UI 显示 "Chrome 未安装"提示
 
 ├── fetch_images_from_url(url: str, timeout: int = 30) -> list[Path]
-│   流程：
-│   1. 复制 Chrome profile：E:\chrome → %TEMP%\opencli_profile_{uuid}
-│      （避免污染用户主 profile，任务结束自动删除）
-│   2. subprocess 启动 Chrome 并导航：
-│      opencli browser open <url> --profile %TEMP%\opencli_profile_{uuid}
-│      参数：--no-first-run --disable-sync --disable-extensions
-│   3. opencli extract 获取页面所有 <img> + background-image URL
-│      使用 CDP (Chrome DevTools Protocol) 内置能力
-│   4. 逐一下载图片到 %TEMP%\opencli_images_{uuid}\
-│   5. 关闭 Chrome 标签页，返还本地路径列表
-├── 按输入 URL 顺序依次处理，不并行（避免 Chrome 实例冲突）
-├── 超时控制：
-│   - 单 URL 导航超时：30s（opencli 内置）
-│   - 单张图片下载超时：10s
-│   - 总 URL 批处理超时：5min
-├── 失败重试：单 URL 失败重试 1 次（仅网络错误，HTTP 4xx/5xx 不重试）
-└── 安全措施：
-    - URL scheme 仅允许 http/https（拒绝 file://、javascript: 等）
-    - 子进程调用用 shlex.quote() 包裹参数
-    - 临时目录任务结束立即清理
-    - opencli 在沙箱模式运行（--sandbox），禁止文件系统写入外部目录
+│   流程:
+│   1. 复制 Chrome profile 到临时目录（隔离）
+│   2. subprocess: opencli browser open <url> --profile <tmp>
+│      参数: --no-first-run --disable-sync --no-default-browser-check
+│   3. opencli extract 获取页面图片 URL
+│   4. 下载到临时目录，返回本地路径
+├── 超时: 导航 30s / 下载 10s / 总批 5min
+├── 重试: 网络错误重试 1 次，HTTP 4xx/5xx 不重试
+└── 安全: URL scheme 白名单，shlex.quote(), SSRF 防护
+```
+
+### 4.7 基线数据规范（v3 新增）
+
+```
+基线数据集（100 张真实图像）用于 Tree-Ring 频环检测和 SynthID 异常检测：
+
+来源:
+  - COCO 2017 val 随机采样 50 张（自然场景，多样性高）
+  - LSUN bedroom 随机采样 30 张（室内场景）
+  - MIT Places 随机采样 20 张（场景多样性）
+采集标准:
+  - 分辨率 ≥ 512×512，JPEG quality ≥ 90
+  - 无任何后期处理（Lightroom/Photoshop 痕迹）
+  - EXIF 中不含 AI 生成软件标签
+  - 每一张检查通过 SPAI 检测确保 ai_score < 0.3
+存储:
+  - 分布式: 仅存储每张图片的频谱特征向量（~4KB/张），不存原图
+  - 路径: watermark_tools/spai-main/data/baseline_features.npz
+更新机制:
+  - 首次启动时自动计算（约 3 分钟），结果缓存到 .npz
+  - 配置项 baseline.update_on_startup: true/false（默认 false，仅首次）
+用户自定义基线:
+  - 提供脚本: python -m watermark_app.update_baseline --input <dir>
+  - 用户提供 50-200 张"正常"图片即可重新计算基线
+  - 新基线覆盖旧 .npz 文件
 ```
 
 ## 5. API 设计
 
-| 方法 | 路径 | 说明 | 请求体 |
-|------|------|------|--------|
-| GET | `/` | 主页面 | — |
-| POST | `/api/embed` | 嵌入水印 | multipart: files[], text, mode(uniform\|mapped), mapping_csv? |
-| POST | `/api/extract` | 提取水印 | multipart: files[] |
-| POST | `/api/detect` | AI 检测 | multipart: files[] |
-| POST | `/api/url-detect` | URL 图片检测 | JSON: {urls: string[]} |
-| GET | `/api/task/{id}/stream` | SSE 进度流 | — |
-| POST | `/api/task/{id}/cancel` | 取消任务 | — |
-| POST | `/api/task/{id}/pause` | 暂停/恢复 | JSON: {action: "pause"\|"resume"} |
-| GET | `/api/download/{id}` | 下载结果 zip | — |
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/` | 主页面 |
+| POST | `/api/embed` | 嵌入水印（multipart） |
+| POST | `/api/extract` | 提取水印（multipart） |
+| POST | `/api/detect` | AI 检测（multipart） |
+| POST | `/api/url-detect` | URL 检测（JSON） |
+| GET | `/api/task/{id}/stream` | SSE 进度流 |
+| GET | `/api/task/{id}/status` | REST 状态查询（SSE 兜底，v3 新增） |
+| POST | `/api/task/{id}/cancel` | 取消任务 |
+| POST | `/api/task/{id}/pause` | 暂停/恢复 |
+| GET | `/api/download/{id}` | 下载结果 zip |
 
-**任务模型（JSON）：**
+**任务模型（v3 更新错误码字段）：**
 ```json
 {
   "task_id": "uuid",
   "type": "embed | extract | detect | url-detect",
+  "queue": "embed | extract | detect | url-detect",
+  "priority": 0,
   "status": "pending | running | paused | completed | cancelled | failed",
   "progress": { "current": 0, "total": 10, "filename": "img005.jpg" },
   "results": [{"filename": "a.jpg", "status": "success", "output": "a_wm.jpg"}],
-  "errors": [{"filename": "b.jpg", "error_code": 2, "error": "unsupported format"}],
+  "errors": [{"filename": "b.jpg", "error_code": "FORMAT_UNSUPPORTED", "error": "unsupported format"}],
   "skipped": [{"filename": "c.bmp", "reason": "unsupported_format"}],
   "created_at": "ISO8601",
+  "queue_position": 3,
   "stats": {"success": 0, "skipped": 0, "failed": 0}
 }
 ```
@@ -221,91 +289,87 @@ def extract_watermark(
 ## 6. 索引映射详细规则
 
 ### 6.1 三种输入方式（优先级：手动编辑 > CSV > 文件名匹配）
-1. **手动编辑**：UI 列表逐行输入，支持从剪贴板批量粘贴（TSV 格式）
-2. **CSV 导入**（UTF-8 编码，无 BOM）：
+1. **手动编辑**：UI 列表逐行输入，支持剪贴板批量粘贴（TSV）
+2. **CSV 导入**（UTF-8 无 BOM）：
    ```csv
    filename,watermark_text
    img001.jpg,"机密文档-2024"
-   img002.jpg,"内部使用-项目Alpha"
    ```
-   列名识别：`filename`/`file`/`name` 列 + `text`/`watermark`/`content` 列
-3. **文件名匹配**：同名 `.txt` 文件，如 `img001.jpg` → `img001.txt`，读取第一行作为水印文本
+   列名: `filename`/`file`/`name` + `text`/`watermark`/`content`
+3. **文件名匹配**：`img001.jpg` → `img001.txt`，读取第一行
 
 ### 6.2 对齐规则
-- 图片按文件名（含扩展名）升序排列，0-based 索引号作为后备
-- CSV/mapping 中文件名与图片文件名的匹配：**精确匹配（含扩展名）**
-- 找不到匹配时回退到忽略扩展名匹配
+- 图片按文件名（含扩展名）升序，0-based 索引为后备
+- CSV 文件名匹配：精确匹配（含扩展名）→ 回退忽略扩展名
 
 ### 6.3 异常处理
 | 情况 | 处理 |
 |------|------|
-| 映射缺失（图片无对应文本） | 标记为 skipped，reason="no_mapping"，不执行嵌入 |
-| 映射重复（同一图片多条文本） | 取第一条，警告日志记录 |
-| 文本过长（>1024字符） | 截断至 1024 字符，前端警告提示 |
-| 文本为空字符串 | 标记错误，error_code=5 |
+| 映射缺失 | skipped，reason="no_mapping" |
+| 映射重复 | 取第一条，WARNING 日志 |
+| 文本 > 1024 字符 | 截断至 1024，前端警告 |
+| 文本为空 | error_code="WATERMARK_TEXT_EMPTY" |
 
-## 7. 批量处理模式（非功能性约束）
+## 7. 批量处理非功能性约束
 
 | 约束项 | 值 |
 |--------|-----|
 | 单次最大文件数 | 1000 张 |
 | 单文件最大大小 | 50MB |
 | 单次上传总大小 | 500MB |
-| ZIP 解压后总大小 | 2GB |
+| ZIP 解压后总大小 | 2GB，解压时监控内存，超过阈值分批处理 |
 | 图片最大像素 | 89478485（≈4K），超大图等比缩放 |
-| 并发水印嵌入/提取 | 4 线程（ThreadPoolExecutor） |
-| 并发 AI 检测 | 串行（SPAI 单 GPU 限制） |
-| 并发 URL 检测 | 串行（Chrome 单实例限制） |
+| embed/extract 并发 | min(4, cpu_count) 线程 |
+| detect 并发 | 1（GPU 限制） |
+| url-detect 并发 | 1（Chrome 限制） |
 | 任务超时（总） | 30 分钟 |
 | 单张水印超时 | 嵌入 60s / 提取 30s |
-| opencli URL 超时 | 导航 30s / 图片下载 10s |
+| opencli URL 超时 | 导航 30s / 下载 10s |
 
-## 8. UI 状态管理
+## 8. UI 状态管理（v3 修订）
 
-### 8.1 标签页行为
-- 两个标签页（A:嵌入 B:提取）由客户端 JS 控制显示/隐藏，不刷新页面
-- 任务队列全局共享：同一时间最多 1 个活跃任务
-- 新任务提交时若已有任务运行：前端弹窗确认"是否等待当前任务完成？"
+### 8.1 标签页与任务队列
+- 两个标签页各自提交到独立队列，不互相阻塞
+- 每个标签页前端独立显示自身队列的排队状态
+- 新任务可随时提交，无需等待其他队列完成
 - 切换标签页不中断运行中的任务
-- 当前活跃任务的状态通过 SSE 推送到两个标签页
+- SSE 按 task_id 过滤，每个标签页只订阅自己的任务事件
 
-### 8.2 预览与缩略图
-- 文件选择后生成缩略图列表（前端用 `URL.createObjectURL` 实现）
-- 缩略图尺寸：200×200 固定，CSS `object-fit: cover`
-- 不发送到后端处理（避免额外上传开销）
-- 处理完成后，结果图支持点击放大查看（Modal 弹窗）
+### 8.2 预览与缩略图（v3 修订：Blob URL 生命周期）
+- 文件选择后用 `URL.createObjectURL()` 生成缩略图
+- **生命周期管理**：
+  - 文件列表更新时：对旧 URL 调用 `URL.revokeObjectURL()`
+  - 组件销毁时（标签页切换/页面卸载）：遍历所有 Blob URL 并 revoke
+  - 缩略图最大内存占用：1000 张 × 200×200 ≈ 40MB（可接受上限）
+  - 超过 500 张时自动切换为"仅文件名列表"模式，不生成缩略图
+- 缩略图尺寸：200×200，CSS `object-fit: cover`
+- 处理完成后结果图支持 Modal 放大查看
+- 批量 > 500 张时自动关闭缩略图渲染，切换到文本列表模式
 
 ### 8.3 进度反馈
-- SSE 推送 `{current, total, filename, status}` 事件
-- 前端渲染进度条 + 当前处理文件名
-- 暂停时进度条变黄色；取消时变灰色
-- 完成后显示统计摘要 + 下载按钮
+- SSE 推送 + REST 轮询兜底（每 5s 轮询 `/api/task/{id}/status`）
+- 暂停/取消按钮状态随任务状态切换
 
 ## 9. 验证逻辑详细说明
 
 ### 9.1 水印文本对比（标签页 B）
-- **基准文本来源（优先级）**：
-  1. 手动输入（文本框）
-  2. CSV 导入（`filename,expected_text`）
-  3. 同名 `.txt` 文件
+- **基准文本来源（优先级）**：手动输入 > CSV > 同名 .txt
 - **对比粒度**：行级（整条提取文本 vs 基准文本）
-- **匹配规则**：完全字符串匹配（大小写敏感），可选"忽略空白"开关
-- **可视化**：表格行背景色
+- **匹配规则**：完全字符串匹配（大小写敏感），可选"忽略空白"
+- **可视化**：
   - 🟢 绿色：完全匹配
-  - 🔴 红色：不匹配（显示差异文本）
-  - ⬜ 灰色：图片中无水印，不参与对比
-  - 🟡 黄色：提取置信度 < 0.5，即使匹配也标记低置信
-- **部分匹配时**：显示提取文本、预期文本、编辑距离（Levenshtein）
+  - 🔴 红色：不匹配（显示差异 + Levenshtein 距离）
+  - ⬜ 灰色：无水印，不参与对比
+  - 🟡 黄色：置信度 < 0.5，即使匹配也标记
 
 ### 9.2 AI 检测结果展示
 | 字段 | 展示形式 |
 |------|----------|
-| ai_score | 数值 + 颜色渐变条形图（绿0-红1） |
-| verdict | 标签徽章："真实"(绿) / "AI生成"(红) / "不确定"(黄) |
-| spectral_mse | 数值，鼠标悬停显示解释："频谱重建误差，越低越接近真实图像分布" |
-| ring_anomaly | >0.6 时显示 ⚠️ "频环异常" |
-| synthid_flag | true 时显示 ⚠️ "频谱异常信号" |
-| c2pa | 徽章：✅"有声明" / ❌"无" / ⬜"不支持" |
+| ai_score | 数值 + 颜色渐变条（绿 0 ↔ 红 1） |
+| verdict | 徽章："真实"/"AI生成"/"不确定" |
+| ring_anomaly | >0.6 时 ⚠️ "频环异常" |
+| synthid_flag | true 时 ⚠️ "频谱异常信号" |
+| c2pa | ✅"有声明" / ❌"无" / ⬜"不支持" |
 
 ## 10. 输出规范
 
@@ -314,193 +378,162 @@ def extract_watermark(
 | 嵌入单张 | `{原文件名}_wm.{ext}` |
 | 提取结果 CSV | `{原文件名}_result.csv` |
 | 批量打包 | `watermark_result_{YYYYMMDD-HHMMSS}.zip` |
-| 错误日志 | `errors.csv`（列: filename, error_code, error_message） |
-| 跳过列表 | `skipped.csv`（列: filename, reason） |
-| AI 检测汇总 | `ai_detection_summary.csv`（列: filename, ai_score, verdict, c2pa, ring_anomaly, synthid_flag） |
-| 重名处理 | 自动追加 `_1`, `_2` 后缀，不覆盖 |
+| 错误日志 | `errors.csv`（filename, error_code, error_message） |
+| 跳过列表 | `skipped.csv`（filename, reason） |
+| AI 检测汇总 | `ai_detection_summary.csv` |
+| 重名处理 | 自动追加 `_1`, `_2`，不覆盖 |
 
 ## 11. 文件处理
 
-### 支持格式
-| 格式 | 嵌入 | 提取 | 检测 | 扩展名 |
-|------|------|------|------|--------|
-| JPEG | ✅ | ✅ | ✅ | .jpg .jpeg |
-| PNG | ✅ | ✅ | ✅ | .png |
-| WebP | ✅ | ✅ | ✅ | .webp |
-| BMP | ✅ | ✅ | ✅ | .bmp |
-| TIFF | ⚠️ 转PNG | ⚠️ 转PNG | ✅ | .tiff .tif |
-| SVG | ❌ | ❌ | ❌ | .svg |
-| GIF | ❌ | ❌ | ❌ | .gif |
-| 其他 | ❌ 跳过 | ❌ 跳过 | ❌ 跳过 | — |
+### 支持格式（同 v2）
+| 格式 | 嵌入 | 提取 | 检测 |
+|------|------|------|------|
+| JPEG/PNG/WebP/BMP | ✅ | ✅ | ✅ |
+| TIFF | ⚠️转PNG | ⚠️转PNG | ✅ |
+| SVG/GIF/其他 | ❌ | ❌ | ❌ |
 
-- ⚠️ TIFF：自动转换为 PNG 后再处理，原 TIFF 不做修改
-- 不支持格式记录到 `skipped.csv`，前端黄色警告显示数量
+## 12. 进度与错误处理（v3 修订）
 
-### 图片尺寸限制
-- 最大像素数：`PIL.Image.MAX_IMAGE_PIXELS` (89M ≈ 4K)
-- 超大图自动等比缩放至最长边 4096px
-- 缩放日志记录到 `errors.csv`（reason="downscaled"）
-
-## 12. 进度与错误处理
+### SSE + REST 双通道（v3 新增）
+- **SSE 主通道**: 实时推送进度事件
+- **REST 兜底**: `GET /api/task/{id}/status` 返回任务完整状态
+- **SSE 心跳**: 每 15 秒发送 `event: heartbeat`，客户端 45 秒无事件则触发重连
+- **客户端重连**: `EventSource` 自动重连 + 手动重连指数退避（1s/2s/4s/8s，最大 30s）
+- **重连后补偿**: 重连成功 → 调用 REST API 获取最新状态 → 继续 SSE 监听
 
 ### SSE 事件类型
 ```
+event: heartbeat
+data: {"timestamp":"ISO8601"}
+
 event: progress
 data: {"current":5,"total":20,"filename":"img005.jpg","status":"embedding"}
 
-event: paused
-data: {"current":5,"total":20,"reason":"user_requested"}
-
-event: resumed
-data: {"current":5,"total":20}
-
-event: cancelled
-data: {"current":5,"total":20,"reason":"user_requested"}
-
+event: paused / resumed / cancelled
 event: error
-data: {"filename":"img_x.jpg","error_code":2,"error":"unsupported format"}
+data: {"filename":"x.jpg","error_code":"FORMAT_UNSUPPORTED","error":"..."}
 
 event: complete
 data: {"success":18,"skipped":1,"failed":1,"download_url":"/api/download/xxx"}
 ```
 
-### 错误恢复与日志
-- 单张失败不影响后续处理
-- 最终报告统计三类：成功/跳过/失败
-- 所有操作日志写入 `logs/app.log`（按天轮转，保留 7 天）
-- 日志级别：批量操作为 INFO，单张错误为 WARNING，系统错误为 ERROR
-- 前端显示实时错误计数（红色角标）
+### 日志与隐私脱敏（v3 修订）
+
+**日志脱敏规则：**
+
+| 字段类型 | 策略 | 示例 |
+|----------|------|------|
+| 文件名 | ✅ 允许 | `img001.jpg` |
+| 文件路径（完整） | ❌ 禁止 | 仅记录 `filename`，不记录完整路径 |
+| 水印文本内容 | ❌ 禁止 | 仅记录长度 `len=12` |
+| URL 地址 | ❌ 禁止 | 仅记录域名 `example.com` |
+| IP 地址 | ❌ 禁止 | 仅记录 `remote_addr=REDACTED` |
+| 错误堆栈 | ⚠️ 仅 WARNING+ | 单张处理错误不记录堆栈，仅 ERROR 级别记录 |
+| 任务 ID | ✅ 允许 | `task_id=uuid` |
+
+**日志轮转**: 按天 + 按大小（10MB），保留 7 天
 
 ### 暂停/取消
-- 暂停：当前图片处理完成后挂起，已处理结果保留
-- 恢复：从下一张未处理的图片继续
-- 取消：立即停止，已处理结果保留可下载
-- 实现：`asyncio.Event` 检查点 + 前端按钮状态切换
+- 暂停：当前图片完成后挂起
+- 恢复：从下一张未处理的继续
+- 取消：立即停止，已处理结果保留
+- 实现：`asyncio.Event` 检查点
 
-## 13. 安全措施
+## 13. 安全措施（v3 修订）
 
 | 风险 | 等级 | 措施 |
 |------|------|------|
-| **路径遍历** — 用户输入含 `../` 逃逸 | 🔴HIGH | `pathlib.resolve()` 校验，结果必须在 `UPLOAD_DIR` 范围内 |
-| **Shell 注入** — opencli URL 参数字符 | 🔴HIGH | URL scheme 仅 http/https；`shlex.quote()` 包裹所有子进程参数；`subprocess.run(shell=False)` |
-| **SSRF** — 通过 URL 检测访问内网 | 🔴HIGH | URL 解析后检查 IP，拒绝私有/内网地址（10.x, 172.16-31.x, 192.168.x, 127.x, [::1]） |
-| **Chrome profile 泄露** — Cookie/凭证 | 🟡MED | 每次任务复制临时 profile，任务结束删除；原 profile 只读 |
-| **文件覆盖** — 输出重名静默覆盖 | 🟡MED | 检测重名自动追加 `_1`, `_2`，不覆盖 |
-| **图片炸弹** — 压缩炸弹/像素炸弹 | 🟡MED | 上传限制 500MB；解压限制 2GB；`MAX_IMAGE_PIXELS` 限制；拒绝 0×0 和 >65536×65536 |
-| **EXIF 隐私泄露** — GPS/相机信息 | 🟡MED | 处理结果的 EXIF 信息默认清除，可选保留；前端提示原始图含 GPS 时显示警告 |
-| **临时文件残留** — 磁盘泄露 | 🟡LOW | 所有 tmp 文件写入 `%TEMP%\watermark_tool\`，任务结束或服务关闭时 `shutil.rmtree` 清理 |
-| **CSV 注入** — 恶意公式 | 🟡LOW | CSV 输出时，以 `=`/`+`/`-`/`@` 开头的字段加单引号前缀 `'` |
+| 路径遍历 | 🔴HIGH | `pathlib.resolve()` + 白名单目录校验 |
+| Shell 注入 | 🔴HIGH | URL scheme 仅 http/https；`shlex.quote()`；`subprocess.run(shell=False)` |
+| SSRF | 🔴HIGH | 解析 URL IP，拒绝私有/内网地址 |
+| Chrome profile 泄露 | 🟡MED | 临时 profile 副本，任务结束删除 |
+| 文件覆盖 | 🟡MED | 重名自动加后缀 |
+| 图片炸弹 | 🟡MED | 上传 500MB 限制；解压 2GB；MAX_IMAGE_PIXELS；拒绝 0×0 和 >65536×65536 |
+| EXIF 隐私 | 🟡MED | 结果图默认清除 EXIF，可选保留 |
+| 临时文件残留 | 🟡LOW | 统一写入 `%TEMP%\watermark_tool\`，任务结束或服务关闭时清理 |
+| **CSV 注入（v3 强化）** | 🟡MED | 使用 `csv.writer(quoting=csv.QUOTE_ALL)`；对所有字段自动转义 `=` `+` `-` `@` `\t` `\r` `\n` 字符；字符串开头危险字符前加单引号，中间字符用 `\` 转义 |
+| **日志敏感信息** | 🟡MED | 见 §12 脱敏规则，禁止记录水印文本/URL/完整路径 |
 
-## 14. 数据存储与隐私
+## 14. 数据存储与隐私（v3 修订）
 
-| 项目 | 策略 |
-|------|------|
-| 上传图片存储 | `%TEMP%\watermark_tool\uploads\{task_id}\`，任务完成后 1 小时自动删除 |
-| 处理结果存储 | `%TEMP%\watermark_tool\results\{task_id}\`，下载后或 24 小时后自动删除 |
-| Chrome profile 副本 | `%TEMP%\watermark_tool\chrome_profiles\{task_id}\`，任务结束立即删除 |
-| opencli 下载图片 | `%TEMP%\watermark_tool\opencli_images\{task_id}\`，任务结束立即删除 |
-| 日志文件 | `logs/app.log`，按天轮转，保留 7 天 |
-| 用户配置 | `config.yaml`，不含密码/密钥 |
+### 滑动过期策略（v3 修订）
+放弃固定 1 小时/24 小时过期，改为基于最后访问时间的滑动窗口：
 
-## 15. 验收标准
+| 数据 | 存储位置 | 过期策略 |
+|------|----------|----------|
+| 上传图片 | `%TEMP%\watermark_tool\uploads\{task_id}\` | 最后一次下载/访问后 **1 小时** |
+| 处理结果 | `%TEMP%\watermark_tool\results\{task_id}\` | 最后一次下载后 **24 小时** |
+| Chrome profile | `%TEMP%\watermark_tool\chrome_profiles\{task_id}\` | 任务结束立即删除 |
+| opencli 图片 | `%TEMP%\watermark_tool\opencli_images\{task_id}\` | 任务结束立即删除 |
+| 日志 | `logs/app.log` | 轮转保留 7 天 |
+
+**实现**: 后台定时任务每 5 分钟扫描过期目录并清理
+**下载接口兜底**: 下载前检查文件是否存在，不存在返回 410 Gone + 友好提示"文件已过期，请重新处理"
+
+## 15. 验收标准（v3 扩展）
 
 | # | 标准 | 量化指标 |
 |---|------|----------|
-| 1 | 批量嵌入 100 张 JPEG (1024×1024) | 总耗时 < 5 分钟，成功率 > 99% |
-| 2 | 批量提取 100 张带水印图 | 提取准确率 > 95%（与嵌入文本完全匹配） |
-| 3 | 内存峰值 | 100 张批量处理时 < 2GB |
-| 4 | opencli URL 超时 | 30s 后自动终止，返回明确错误码 |
-| 5 | opencli URL 无响应 | 重试 1 次后标记 failed，不阻塞后续 URL |
-| 6 | SPAI 检测准确率 | 预置 10 张测试集（5真+5AI），AUC > 0.85 |
-| 7 | 取消操作响应 | 点击取消后 5s 内当前图片处理完成并停止 |
-| 8 | 不支持格式 | 自动跳过并记录 skipped.csv，不崩溃 |
-| 9 | 路径遍历攻击 | 所有路径解析被拒绝，返回 403 |
-| 10 | 内网 SSRF | 私有 IP URL 被拒绝，返回 400 |
-| 11 | TIFF 兼容 | 自动转 PNG 处理，结果与原图对比验证 |
-| 12 | 文件覆盖保护 | 重名文件自动重命名，无数据丢失 |
-| 13 | 单文件 > 50MB | 前端拦截 + 后端校验，返回 413 |
-| 14 | 空文件导入 | 前端提示"无可处理的图片"，不发起 API 请求 |
+| 1 | 批量嵌入 100 张 JPEG (1024×1024) | 耗时 < 5min，成功率 > 99% |
+| 2 | 批量提取 100 张 | 提取准确率 > 95% |
+| 3 | 内存峰值 | 100 张处理时 < 2GB |
+| 4 | opencli 超时 | 30s 终止，返回 `WATERMARK_TIMEOUT` |
+| 5 | opencli 无响应 | 重试 1 次后标记 failed，不阻塞后续 |
+| 6 | SPAI 检测 | 10 张测试集 AUC > 0.85 |
+| 7 | 取消响应 | 5s 内当前图片处理完成并停止 |
+| 8 | 不支持格式 | 跳过 + 记录 skipped.csv，不崩溃 |
+| 9 | 路径遍历 | 所有攻击 payload 返回 403 |
+| 10 | SSRF | 私有 IP URL 返回 400 |
+| 11 | TIFF 兼容 | 自动转 PNG，结果验证 |
+| 12 | 文件覆盖保护 | 重名自动重命名 |
+| 13 | 单文件 > 50MB | 前端拦截 + 后端 413 |
+| 14 | 空文件导入 | 前端提示，无 API 请求 |
+| **15** | **JPEG 压缩鲁棒性** | quality=70 压缩后提取准确率 > 90% |
+| **16** | **缩放鲁棒性** | 50% 缩放后提取准确率 > 80% |
+| **17** | **多队列并发** | embed 100 张期间，extract 10 张独立执行，不等待 embed 完成 |
+| **18** | **暂停恢复一致性** | 暂停后恢复，结果与不暂停完全一致（无重复、无遗漏） |
+| **19** | **ZIP 解压内存** | 2GB ZIP 解压时内存峰值 < 4GB，超大 ZIP 分片处理 |
+| **20** | **浏览器关闭清理** | 页面关闭后 30s 内 SSE 连接释放，任务继续运行不受影响 |
+| **21** | **恶意 CSV** | `=cmd\|'/C calc'!A0` 等注入 payload 被转义，不执行公式 |
+| **22** | **Blob URL 泄漏** | 1000 张图片场景，切换标签页后所有 Blob URL 被 revoke |
+| **23** | **SSE 断线恢复** | SSE 断开后 15s 内心跳检测超时，30s 内完成重连 + 状态同步 |
+| **24** | **Chrome 自动探测** | 无 config.yaml 时自动找到系统 Chrome，找不到时 UI 提示而非崩溃 |
 
 ## 16. 目录结构
 
-```
-watermark/
-├── main.py                    # 应用入口（uvicorn 启动）
-├── pyproject.toml
-├── config.yaml                # 应用配置
-│   # chrome_path: "E:\\chrome"
-│   # upload_max_size_mb: 500
-│   # max_files_per_batch: 1000
-│   # log_level: "INFO"
-│   # log_retention_days: 7
-├── watermark_app/
-│   ├── __init__.py
-│   ├── main.py                # FastAPI app 工厂 + 生命周期
-│   ├── config.py              # 配置加载（YAML + 环境变量覆盖）
-│   ├── routers/
-│   │   ├── __init__.py
-│   │   ├── embed.py
-│   │   ├── extract.py
-│   │   └── detect.py
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── watermark_service.py   # blind-watermark 封装
-│   │   ├── spai_service.py        # SPAI 频谱检测
-│   │   ├── ring_detector.py       # Tree-Ring 频环检测
-│   │   ├── c2pa_service.py        # C2PA/EXIF 元数据
-│   │   └── opencli_service.py     # opencli subprocess 封装
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── task.py                # 任务数据模型 + 状态机
-│   │   └── results.py             # EmbedResult, ExtractResult, DetectResult
-│   ├── templates/
-│   │   ├── base.html
-│   │   ├── index.html
-│   │   └── components/            # htmx 局部刷新组件
-│   │       ├── file_list.html
-│   │       ├── progress_bar.html
-│   │       └── result_table.html
-│   └── static/
-│       ├── htmx.min.js
-│       └── app.js
-├── watermark_tools/           # 外部工具目录（已有）
-│   ├── spai-main/             # SPAI 检测引擎
-│   └── node_modules/          # opencli
-├── tests/
-│   ├── test_watermark_service.py
-│   ├── test_spai_service.py
-│   ├── test_opencli_service.py
-│   ├── test_api.py
-│   └── conftest.py            # fixtures（测试图片、mock opencli）
-└── logs/                      # 运行时日志（.gitignore）
-```
+（同 v2，无结构变更）
 
-## 17. 测试策略
+## 17. 测试策略（v3 扩展）
 
 | 层级 | 工具 | 覆盖内容 |
 |------|------|----------|
-| 单元测试 | pytest | 各 service 函数，mapping 规则，错误码转换 |
-| 集成测试 | pytest + httpx | FastAPI TestClient，完整 API 流程（上传→处理→下载） |
-| SPAI 测试 | 预置 10 张（5真+5AI） | AUC > 0.85，单张推理 < 5s |
-| opencli 测试 | mock `subprocess.run` | URL 校验、超时、重试、profile 清理逻辑 |
-| 安全测试 | pytest 参数化 | 路径遍历 payload、SSRF IP 列表、Shell 注入字符串 |
-| 验收测试 | 按 §15 逐条验证 | 手动执行或 CI 脚本 |
+| 单元测试 | pytest | 各 service 函数，mapping 规则，错误码转换，**鲁棒性测试** |
+| 集成测试 | pytest + httpx | API 流程，**多队列并发测试**，**暂停/恢复一致性** |
+| SPAI 测试 | 10 张测试集 | AUC > 0.85，单张 < 5s |
+| opencli 测试 | mock `subprocess.run` | URL 校验、超时、重试、**Chrome 路径探测** |
+| 安全测试 | pytest 参数化 | 路径遍历、SSRF、Shell 注入、**CSV 注入 payload 集** |
+| 前端测试 | **浏览器内存快照** | Blob URL 泄漏检查、缩略图 > 500 张切换逻辑 |
+| 验收测试 | §15 逐条验证 | 手动 + CI 脚本 |
 
 ---
 
-## 审计修订记录 (v2)
+## 审计修订记录
 
-根据外部审查意见（10条），v2 新增/修订：
+### v3（当前版本）— 响应 11 条新增审查意见
 
-| # | 审查意见 | 修订内容 | 所在章节 |
-|---|----------|----------|----------|
-| 1 | 日期笔误 | 确认 2026-06-21 为实际创建日期，非笔误 | 头部 |
-| 2 | prompt 协议未定义 | 新增完整函数签名、参数、错误返回码、超时 | §2 |
-| 3 | 索引映射模糊 | 新增对齐规则、匹配优先级、异常处理表 | §6 |
-| 4 | AI 检测标准缺失 | 新增置信度阈值、多标准并行、结果展示格式、低置信处理 | §4.2-4.5, §9.2 |
-| 5 | OpenCLI 细节缺失 | 明确 subprocess 方式、profile 隔离机制、启动参数、超时、重试、安全措施 | §4.6 |
-| 6 | 非功能性需求缺失 | 新增完整 NFR 约束表、暂停/取消机制、日志轮转 | §7, §12 |
-| 7 | UI 状态管理未定义 | 新增标签页行为、缩略图策略、SSE 广播、任务队列共享规则 | §8 |
-| 8 | 验证高亮缺乏定义 | 新增对比粒度、匹配规则、颜色编码、部分匹配处理 | §9.1 |
-| 9 | 安全与隐私缺失 | 新增数据存储策略、临时文件清理、SSRF 防护、EXIF 处理 | §13, §14 |
-| 10 | 验收标准缺失 | 新增 14 条量化验收标准 | §15 |
+| # | 审查意见 | 修订内容 | 章节 |
+|---|----------|----------|------|
+| 1 | 盲水印算法参数缺失 | 补充嵌入强度、频域选择、5 种攻击鲁棒性目标 | §2.1, §15 |
+| 2 | 任务队列单点瓶颈 | 改为类型分离独立队列（embed/extract/detect/url-detect），并发可配置 | §3.1, §8.1 |
+| 3 | SPAI 基线数据未定义 | 新增基线数据规范（来源/标准/存储/更新/用户自定义接口） | §4.7 |
+| 4 | Chrome 路径硬编码 | 新增 4 级 fallback 自动探测链 + 失败降级提示 | §4.6 |
+| 5 | SSE 断线可靠性 | 新增心跳(15s)、指数退避重连、REST API 兜底状态查询 | §12 |
+| 6 | 文件删除竞态风险 | 改为基于最后访问时间的滑动过期策略 + 下载前文件存在性检查 | §14 |
+| 7 | CSV 注入不完整 | 补充 `\t` `\r` `\n` 转义，使用 `csv.QUOTE_ALL`，白名单策略 | §13 |
+| 8 | 验收标准缺边界测试 | 新增 10 条边界验收：鲁棒性、多队列并发、暂停一致性、ZIP 内存、恶意 CSV、Blob 泄漏等 | §15 |
+| 9 | 错误码扩展性不足 | 改为字符串语义码（`WATERMARK_TEXT_TOO_LONG` 等），扩展规则明确 | §2.4 |
+| 10 | 日志敏感信息泄露 | 新增脱敏规则表，明确禁止记录水印文本/URL/完整路径 | §12 |
+| 11 | 前端 Blob URL 内存泄漏 | 新增 revokeObjectURL 生命周期管理 + >500 张切换文本列表 | §8.2 |
+
+### v2 — 响应 10 条审查意见（首次外部审计）
+### v1 — 初始设计文档
