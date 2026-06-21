@@ -1,0 +1,25 @@
+[project]
+name = "watermark"
+version = "0.1.0"
+description = "批量盲水印嵌入提取 + AI生成图像检测工具"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "blind-watermark>=0.4.4",
+    "pandas>=3.0.3",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "jinja2>=3.1.0",
+    "pillow>=10.4.0",
+    "opencv-python>=4.10.0",
+    "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
+    "aiofiles>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+]
