@@ -29,6 +29,11 @@ def create_app() -> FastAPI:
     app.state.config = config
     app.state.queue_manager = TaskQueueManager()
 
+    from watermark_app.routers import embed, extract, detect
+    app.include_router(embed.router)
+    app.include_router(extract.router)
+    app.include_router(detect.router)
+
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
