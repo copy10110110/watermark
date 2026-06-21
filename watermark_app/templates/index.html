@@ -2,10 +2,107 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>Watermark Tool</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Watermark Tool — 批量盲水印 + AI 检测</title>
+    <style>
+        :root { --bg: #f8f9fa; --card: #ffffff; --border: #dee2e6; --text: #212529; --muted: #6c757d; --primary: #2563eb; --danger: #dc2626; --success: #16a34a; --warn: #d97706; --radius: 8px; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+        header { background: var(--card); border-bottom: 1px solid var(--border); padding: 12px 24px; margin-bottom: 24px; }
+        header h1 { font-size: 1.25rem; font-weight: 600; }
+        .tab-bar { display: flex; gap: 0; border-bottom: 2px solid var(--border); margin-bottom: 24px; }
+        .tab-btn { padding: 10px 24px; border: none; background: none; cursor: pointer; font-size: 0.95rem; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -2px; }
+        .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+        .form-group { margin-bottom: 12px; }
+        .form-group label { display: block; font-weight: 500; margin-bottom: 4px; font-size: 0.9rem; }
+        .form-group input[type="text"], .form-group select { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 0.95rem; }
+        .btn { padding: 8px 20px; border: none; border-radius: var(--radius); cursor: pointer; font-size: 0.9rem; font-weight: 500; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-outline { background: none; border: 1px solid var(--border); color: var(--text); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .progress-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin: 12px 0; }
+        .progress-fill { height: 100%; background: var(--primary); transition: width 0.3s; border-radius: 4px; width: 0%; }
+        .status-bar { display: flex; gap: 16px; font-size: 0.85rem; color: var(--muted); margin: 8px 0; }
+        .result-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        .result-table th, .result-table td { padding: 8px; border: 1px solid var(--border); text-align: left; }
+        .result-table .match { background: #dcfce7; }
+        .result-table .mismatch { background: #fef2f2; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 500; }
+        .badge-ai { background: #fef2f2; color: var(--danger); }
+        .badge-real { background: #dcfce7; color: var(--success); }
+        .badge-unknown { background: #fef3c7; color: var(--warn); }
+        .hidden { display: none; }
+    </style>
 </head>
 <body>
-    <h1>Watermark Tool</h1>
-    <p>批量盲水印 + AI 检测工具</p>
+    <header><h1>🖼️ Watermark Tool — 批量盲水印 + AI 检测</h1></header>
+    <main class="container">
+        <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('embed')">🔏 嵌入水印</button>
+            <button class="tab-btn" onclick="switchTab('extract')">🔍 提取 / 验证</button>
+        </div>
+
+        <div id="tab-embed" class="tab-content active">
+            <div class="card">
+                <div class="form-group">
+                    <label>处理模式</label>
+                    <select id="embed-mode">
+                        <option value="uniform">统一水印（所有图片相同文本）</option>
+                        <option value="mapped">索引映射（每张图不同文本）</option>
+                    </select>
+                </div>
+                <div class="form-group" id="uniform-text-group">
+                    <label>水印文本</label>
+                    <input type="text" id="embed-text" placeholder="输入水印文本（最长1024字符）" maxlength="1024">
+                </div>
+                <div class="form-group">
+                    <label>选择图片</label>
+                    <input type="file" id="embed-files" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tiff,.tif">
+                </div>
+                <div>
+                    <button class="btn btn-primary" id="embed-start-btn" onclick="startEmbed()">开始嵌入</button>
+                    <button class="btn btn-danger hidden" id="embed-cancel-btn" onclick="cancelCurrent('embed')">取消</button>
+                    <button class="btn btn-outline hidden" id="embed-pause-btn" onclick="togglePause('embed')">暂停</button>
+                </div>
+            </div>
+            <div id="embed-progress" class="card hidden">
+                <div class="progress-bar"><div id="embed-progress-fill" class="progress-fill"></div></div>
+                <div class="status-bar">
+                    <span id="embed-status-text">等待开始...</span>
+                    <span>✅ <span id="embed-success-count">0</span></span>
+                    <span>❌ <span id="embed-fail-count">0</span></span>
+                </div>
+            </div>
+            <div id="embed-results" class="card hidden"><h3>处理结果</h3><div id="embed-result-list"></div></div>
+        </div>
+
+        <div id="tab-extract" class="tab-content">
+            <div class="card">
+                <div class="form-group">
+                    <label>基准文本（可选，用于对比验证）</label>
+                    <input type="text" id="baseline-text" placeholder="期望的水印文本（留空则仅提取不对比）">
+                </div>
+                <div class="form-group">
+                    <label>选择图片</label>
+                    <input type="file" id="extract-files" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tiff,.tif">
+                </div>
+                <div>
+                    <button class="btn btn-primary" id="extract-start-btn" onclick="startExtract()">开始提取 + AI 检测</button>
+                    <button class="btn btn-danger hidden" id="extract-cancel-btn" onclick="cancelCurrent('extract')">取消</button>
+                </div>
+            </div>
+            <div id="extract-progress" class="card hidden">
+                <div class="progress-bar"><div id="extract-progress-fill" class="progress-fill"></div></div>
+                <div class="status-bar"><span id="extract-status-text">等待开始...</span></div>
+            </div>
+            <div id="extract-results" class="card hidden"><h3>提取 & AI 检测结果</h3><div id="extract-result-table"></div></div>
+        </div>
+    </main>
+    <script src="/static/app.js"></script>
 </body>
 </html>
