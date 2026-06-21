@@ -17,6 +17,16 @@ dependencies = [
     "aiofiles>=24.0.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["watermark_app", "watermark_app.*"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
