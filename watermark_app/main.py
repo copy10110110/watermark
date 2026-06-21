@@ -1,9 +1,11 @@
 import asyncio
 import json
+import shutil
+import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader
@@ -13,8 +15,8 @@ from watermark_app.queue.manager import TaskQueueManager
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
+OUTPUT_BASE = Path("outputs")  # 项目根 outputs/
 
-# Use a plain dict-based cache to avoid Jinja2 LRUCache weakref issues on Python 3.14
 _env = Environment(
     loader=FileSystemLoader(str(TEMPLATES_DIR)),
     auto_reload=False,
@@ -65,5 +67,24 @@ def create_app() -> FastAPI:
         else:
             success = await mgr.resume(task_id)
         return {"success": success}
+
+    @app.get("/api/download/{task_id}")
+    async def download_results(task_id: str):
+        """打包下载处理结果"""
+        output_dir = OUTPUT_BASE / task_id
+        if not output_dir.exists():
+            return JSONResponse({"error": "结果已过期或不存在"}, status_code=410)
+
+        # 打包为 zip
+        zip_path = output_dir.with_suffix(".zip")
+        if not zip_path.exists():
+            shutil.make_archive(str(output_dir), "zip", str(output_dir))
+            zip_path = output_dir.with_suffix(".zip")
+
+        return FileResponse(
+            path=str(zip_path),
+            filename=f"watermark_result_{task_id[:8]}.zip",
+            media_type="application/zip",
+        )
 
     return app

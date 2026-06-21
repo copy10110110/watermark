@@ -76,6 +76,11 @@ function showResults(task, type) {
     const container = document.getElementById(`${type}-results`);
     if (!container) return;
     container.classList.remove('hidden');
+    // 添加下载按钮
+    let downloadHtml = '';
+    if (task.download_url) {
+        downloadHtml = `<div style="margin-bottom:12px"><a href="${task.download_url}" class="btn btn-primary" download>📥 下载结果 ZIP</a></div>`;
+    }
     if (type === 'extract') {
         let html = '<table class="result-table"><tr><th>文件</th><th>提取文本</th><th>置信度</th><th>AI分数</th><th>判定</th></tr>';
         for (const r of (task.results || [])) {
@@ -85,12 +90,12 @@ function showResults(task, type) {
             html += `<tr class="${cls}"><td>${r.filename || '-'}</td><td>${r.text || '—'}</td><td>${r.confidence != null ? (r.confidence*100).toFixed(0)+'%' : '-'}</td><td>${r.ai_score != null ? r.ai_score.toFixed(2) : '-'}</td><td><span class="badge ${badgeCls}">${verdict}</span></td></tr>`;
         }
         html += '</table>';
-        document.getElementById('extract-result-table').innerHTML = html;
+        document.getElementById('extract-result-table').innerHTML = downloadHtml + html;
     } else {
         let html = '';
         for (const r of (task.results || [])) html += `<div style="color:var(--success)">✅ ${r.output || r.filename || '-'}</div>`;
         for (const e of (task.errors || [])) html += `<div style="color:var(--danger)">❌ ${e.filename} — ${e.error}</div>`;
-        document.getElementById(`${type}-result-list`).innerHTML = html;
+        document.getElementById(`${type}-result-list`).innerHTML = downloadHtml + html;
     }
 }
 

@@ -11,3 +11,6 @@ wheels/
 
 # Superpowers
 .superpowers/
+
+# Output files
+outputs/
