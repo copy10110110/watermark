@@ -1,0 +1,24 @@
+# Watermark Tool 配置文件
+# 所有字段均为可选，不指定则使用默认值
+
+# Chrome 浏览器路径（不指定则自动探测）
+# chrome_path: "E:\\chrome"
+
+# 上传限制
+# upload_max_size_mb: 500
+# max_files_per_batch: 1000
+
+# 日志
+# log_level: "INFO"        # DEBUG | INFO | WARNING | ERROR
+# log_retention_days: 7
+
+# 水印参数
+# embed_strength: 0.8      # 嵌入强度 0.1-1.0
+# embed_domain: "dwt"      # dwt | dct
+
+# 超时设置（秒）
+# watermark_timeout_embed_sec: 60
+# watermark_timeout_extract_sec: 30
+# opencli_timeout_nav_sec: 30
+# opencli_timeout_download_sec: 10
+# opencli_timeout_total_min: 5
